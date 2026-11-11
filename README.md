@@ -3,10 +3,13 @@
 A differentiable Gaussian Splatting rasterizer for PyTorch, targeting Apple
 Silicon via Metal instead of CUDA -- a `gsplat`-equivalent that runs
 entirely on the MPS backend, with real hand-written Metal compute kernels
-for the performance-critical stages. Two pipelines: classic **3D Gaussian
-Splatting** (best novel-view quality) and **[2D Gaussian
+for the performance-critical stages. Three pipelines: classic **3D Gaussian
+Splatting** (best novel-view quality), **[2D Gaussian
 Splatting](#2d-gaussian-splatting)** (flat oriented surfels with exact,
-differentiable depth and normals, for when the geometry itself matters).
+differentiable depth and normals, for when the geometry itself matters),
+and **[Hexels](#hexels-honeycomb-surfels)** (hexagonal surfels with a
+per-primitive color field: compact planar primitives, trainable here and
+compatible with the reference CUDA trainer's checkpoints).
 
 ![RGB and depth renders of the garden scene, over a full orbit](docs/garden_orbit.webp)
 
@@ -428,6 +431,189 @@ filter generalized to two scales, and a cleanup pass tuned for 2DGS
 (`metalsplat/cleanup.py`'s floater pruning and view-dependence damping
 accept a `Gaussian2DModel`, but the orbit above is rendered from the raw
 trained model, with no cleanup pass).
+
+## Hexels (Honeycomb-Surfels)
+
+A third pipeline for **Hexels** (Kaushik, Paul and Yuille 2026,
+["Honeycomb-Surfels: Compact Hexagonal Primitives for Efficient Scene
+Rendering and Reconstruction"](https://honeycomb-surfels.github.io/)):
+planar surfels like 2DGS splats, but with a soft-edged regular **hexagon**
+footprint instead of a gaussian, and a **color field** that varies across
+each primitive. Fewer, larger primitives can then cover locally planar,
+smoothly shaded regions. The reference implementation
+([honeycomb-surfels/hexels](https://github.com/honeycomb-surfels/hexels),
+kernel in [hexel-kernel](https://github.com/honeycomb-surfels/hexel-kernel))
+needs an NVIDIA GPU. This pipeline trains and renders Hexels on Apple
+Silicon, and loads the reference trainer's checkpoints, including the
+[published pretrained models](https://huggingface.co/jhu-ccvl/Hexels).
+
+```python
+from metalsplat import Camera, HexelModel, render_hexels
+from metalsplat.losses import distortion_loss
+
+model = HexelModel.from_points(points, colors, variant="v3").to("mps")  # v1 / v2 / v3
+aux = render_hexels(model, camera, return_aux=True)
+loss = aux.image.mean() + distortion_loss(aux.distortion)
+loss.backward()
+```
+
+### The primitive
+
+Each Hexel has a center, a quaternion (the first two rotation columns span
+its plane), two tangent scales, an opacity and an edge **softness**. Per
+pixel, the rasterizer intersects the ray with the plane exactly, using the
+same homogeneous two-plane solve as the 2DGS pipeline. It gets local,
+scale-normalized coordinates `(u, v)` and evaluates:
+
+```
+alpha = min(0.99, opacity * sigmoid(-softness_e * sdf_hex(u, v)))
+color = c + u * g_u + v * g_v   [+ u^2 q_uu + u v q_uv + v^2 q_vv]
+```
+
+`sdf_hex` is the signed distance to the unit-apothem hexagon, written as
+the max of three half-plane distances. `softness_e` is the softness of the
+winning edge family, so with `softness_mode="aniso"` a Hexel's three edge
+orientations can each have a different sharpness. Variants are presets of
+the color and view models, with the paper's per-primitive sizes:
+
+| Variant | Appearance | FP32 state / Hexel |
+|---|---|---:|
+| `v1` | spatial color (`color_model="linear"`) | 80 B |
+| `v2` | + linear view dependence (`view_model="linear"`) | 116 B |
+| `v3` | + degree-3 SH view dependence (`view_model="sh3"`) | 260 B |
+
+All of hexel-kernel's release rasterizer features are covered:
+
+- **Color models:** `flat`, `linear`, `quadratic`, `quadratic_bounded`.
+- **View models:** `none`, `linear`, `sh3`, `lobe` (specular). View terms
+  are per-primitive constants and are folded into the base color in
+  PyTorch, as the reference trainer does.
+- **Softness:** iso and aniso.
+- **Differentiable outputs:** `image`, `alpha`, `depth`, `normal`,
+  `distortion`, `median_depth` and `overdraw` (sum of unclamped alpha, for
+  screen repulsion).
+- **Forward-only outputs:** `overdraw_hits`, and per-primitive `contrib`
+  (summed compositing weight, for MCMC).
+- **Screen-space accumulators:** AbsGS signal, pixel counts and signed
+  gradient, for densification.
+- **Owner render:** `render_hexels_owner` gives the per-pixel
+  max-weight primitive with its `(u, v)`, SDF value and depth.
+
+### Training
+
+```bash
+uv run python examples/fit_image_hexels.py                 # smoke test
+uv run python examples/train_hexels.py --source data/dtu/scan24 --variant v3
+uv run python examples/train_hexels.py --source data/dtu/scan24 --variant v3 \
+    --surface --all-views                                   # surface recipe
+uv run python examples/train_hexels.py --source data/garden --images images_4 \
+    --mcmc --cap-max 1000000                                # MCMC growth
+```
+
+Defaults reproduce the published NVS runs (the `config.json` shipped with
+each pretrained checkpoint): identity orientations, initial scale 0.25 x
+the RMS distance to the 3 nearest SfM points (capped at 0.05 x the camera
+extent), opacity 0.1, softness 10, hexels' per-parameter Adam rates with a
+constant unscaled position rate, every rate halved at steps 15001, 20001
+and 25001, and (1 - 0.2) L1 + 0.2 (1 - SSIM).
+Trained from scratch this way on DTU scan24 (V1, 31,205 fixed Hexels,
+30k steps, 29.6 min on an M1 Max), the held-out PSNR is 26.09 dB, against
+26.43 dB for the published CUDA run of the same configuration. A single
+seed of each; the reference notes that fresh CUDA runs also vary, from
+nondeterministic atomic accumulation.
+`--surface` is the reference surface recipe (`configs/surface.json`): normal
+consistency against normals from median depth (weight 0.05 from step 7k),
+and ray distortion (weight 1000 from step 3k, ramped over 1k). Population
+control works in either of two ways:
+
+- **`--mcmc`:** contribution-driven relocation and growth, a port of the
+  reference `mcmc.py` and trainer step.
+- **`--densify`:** metalsplat's 2DGS adaptive density control, which
+  applies to `HexelModel` unchanged.
+
+Each function returns a `source_index`, so Adam state follows rows through
+`migrate_optimizer_state`.
+
+### Pretrained checkpoints
+
+```python
+from metalsplat import Camera, render_hexels
+from metalsplat.export_hexels import load_hexels_checkpoint
+
+model = load_hexels_checkpoint("ckpt_030000.pt", variant="v1", device="mps")
+camera = Camera.from_3dgs(world_view_transform, fov_x, fov_y, width, height)
+image = render_hexels(model, camera.to("mps"))
+```
+
+`load_hexels_checkpoint` reads full and compact (deployment) checkpoints.
+It drops inactive rows and flattens child primitives into independent
+ones. Reference checkpoints don't record their variant, so it is inferred
+when not given. `Camera.from_3dgs` converts the reference's
+`world_view_transform` and field-of-view cameras, for example from the
+published `cameras/.../contract.json`.
+
+Rendered this way, the published DTU scan24 V1, V2 and V3 checkpoints
+reproduce the paper's held-out PSNR on all 21 test views to within
+4e-5 dB (V1 26.430, V2 26.849, V3 28.571 dB mean, as published), against
+targets whose hashes match the published camera contract. The V1 model
+(31k Hexels) renders its held-out views at 777x581 in about 11 ms (~90 fps)
+on an M1 Max; a full training step (forward + backward) there takes ~41 ms.
+`export_hexels.save_ply`/`load_ply` round-trip a `HexelModel` losslessly.
+
+### Correctness
+
+As with the other pipelines, a pure-PyTorch reference
+(`metalsplat/reference/hexels_ref.py`) transcribes hexel-kernel's CUDA
+math and serves as the oracle. The Metal kernels match it in every output
+and in the gradient of every parameter. The tests cover all four color
+models, partial edge tiles, the accumulators, the owner render and all
+four view models. Further tests check:
+
+- The `(u, v)` solve against a direct world-space ray-plane intersection.
+- That exact tile rectangles bound every pixel a primitive can reach, and
+  that the default ones only ever clip them.
+- End to end, the published checkpoints above, against the paper's
+  numbers (not in the test suite: it needs the DTU images).
+
+Deviations from hexel-kernel:
+
+- **Not ported** (diagnostic or opt-in there, and disabled by every release
+  recipe): the edge prefilter, exact-sort and pixel-risk kernels, and the
+  child-primitive split of surface compositing.
+- **Tile bounds** follow hexel-kernel's default: the exact hexagon bounds
+  intersected with its historical ellipse window, which drops some real
+  contributions of large primitives. Models trained with it depend on it:
+  with exact bounds alone the published scan24 V1 checkpoint loses 2 dB
+  (9.8 dB on one view). `conservative_bounds=True` selects the exact
+  bounds, as the same CUDA flag does.
+- **Screen-space gradients** are in pixels, not NDC-scaled pixels.
+- **The projection** is plain differentiable PyTorch; the per-primitive
+  hexagon tile bounds and all per-pixel work run in Metal.
+
+### Module map
+
+- `metalsplat/hexels_model.py`: `HexelModel`, variants, row ops and
+  hexels' default learning rates (`parameter_groups`).
+- `metalsplat/reference/hexels_ref.py`: projection, hexagon tile bounds,
+  view-color residuals and the brute-force reference rasterizer.
+- `metalsplat/kernels/project_hexels.metal` and
+  `metalsplat/ops/project_hexels.py`: hexagon tile bounds, one thread per
+  primitive.
+- `metalsplat/kernels/rasterize_hexels.metal` and
+  `metalsplat/ops/rasterize_hexels.py`: forward and backward rasterizer, and
+  the owner render. The forward pass walks lists SIMD-uniformly so
+  per-primitive `contrib` and gradients are reduced with `simd_sum` before
+  any atomic.
+- `metalsplat/rendering.py`: `render_hexels`, `render_hexels_owner` and
+  `RenderHexelsAux`.
+- `metalsplat/mcmc_hexels.py`: MCMC relocation and growth, position noise,
+  contrib EMA, and densify/prune aliases.
+- `metalsplat/export_hexels.py`: `.ply` I/O and the reference checkpoint
+  loader.
+
+The Hexel rendering model, constants and default recipe are transcribed
+from the MIT-licensed hexels and hexel-kernel projects; see
+[NOTICE.md](NOTICE.md).
 
 ## Roadmap
 

@@ -10,11 +10,24 @@ from metalsplat.camera import Camera
 from metalsplat.filter3d import apply_3d_filter
 from metalsplat.gaussians import GaussianModel
 from metalsplat.gaussians_2dgs import Gaussian2DModel
+from metalsplat.hexels_model import HexelModel
 from metalsplat.ops.project import project_gaussians
 from metalsplat.ops.project_2dgs import project_gaussians_2dgs
+from metalsplat.ops.project_hexels import hexel_rects as metal_hexel_rects
 from metalsplat.ops.rasterize import rasterize_gaussians
 from metalsplat.ops.rasterize_2dgs import rasterize_gaussians_2dgs
+from metalsplat.ops.rasterize_hexels import (
+    HexelOwner,
+    rasterize_hexels,
+    rasterize_hexels_owner,
+)
 from metalsplat.ops.tiling import DEFAULT_TILE_SIZE
+from metalsplat.reference.hexels_ref import (
+    NEAR_PLANE,
+    HexelProjection,
+    project_hexels,
+    view_color_residual,
+)
 from metalsplat.reference.rasterize_2dgs_ref import DEFAULT_FILTER_SIZE
 
 
@@ -289,3 +302,172 @@ def render_2dgs(
             distortion=distortion,
         )
     return image
+
+
+class RenderHexelsAux(NamedTuple):
+    """Outputs of `render_hexels(..., return_aux=True)`.
+
+    `image`, `alpha`, `depth`, `normal`, `distortion`, `median_depth` and
+    `overdraw` are differentiable. `depth`/`normal` are alpha-weighted sums
+    (as in 2DGS: divide by `alpha` for expected values), so they feed
+    `metalsplat.losses.normal_consistency_loss(normal, depth, alpha,
+    camera)` and `distortion_loss(distortion)` directly. `median_depth` is
+    the depth of the last primitive composited while transmittance was
+    above 0.5 (hexels' median-depth surface extraction). `overdraw` is the
+    sum of unclamped alpha over every primitive a pixel visited (hexels'
+    screen-repulsion signal); `overdraw_hits` counts them.
+    """
+
+    image: torch.Tensor  # (H, W, 3)
+    alpha: torch.Tensor  # (H, W)
+    depth: torch.Tensor  # (H, W)
+    normal: torch.Tensor  # (H, W, 3)
+    distortion: torch.Tensor  # (H, W)
+    median_depth: torch.Tensor  # (H, W)
+    overdraw: torch.Tensor  # (H, W)
+    overdraw_hits: torch.Tensor  # (H, W), no grad
+    final_T: torch.Tensor  # (H, W), no grad
+    contrib: (
+        torch.Tensor
+    )  # (N,) summed compositing weight, no grad (zeros unless requested)
+    means2d: torch.Tensor  # (N, 2) projected centers, pixels
+    valid: torch.Tensor  # (N,) bool, binned for rasterization
+    projection: HexelProjection
+
+
+def _hexel_inputs(
+    model: HexelModel,
+    camera: Camera,
+    near: float,
+    scale_modifier: float,
+    conservative_bounds: bool = False,
+):
+    opacities = model.opacities
+    softness3 = model.softness3
+    proj = project_hexels(
+        model.means,
+        model.scales,
+        model.quats,
+        opacities,
+        softness3,
+        camera.R_wc,
+        camera.t_wc,
+        camera.fx,
+        camera.fy,
+        camera.cx,
+        camera.cy,
+        camera.img_width,
+        camera.img_height,
+        near=near,
+        scale_modifier=scale_modifier,
+        rects_fn=metal_hexel_rects if model.means.device.type == "mps" else None,
+        conservative_bounds=conservative_bounds,
+    )
+    colors = model.colors
+    residual = view_color_residual(
+        model.view_model,
+        proj.view_dirs,
+        proj.raw_normal,
+        getattr(model, "view_grads", None),
+        getattr(model, "specular_ks", None),
+        getattr(model, "specular_log_s", None),
+        sh_degree=model.active_sh_degree,
+    )
+    if residual is not None:
+        colors = colors + residual
+    n = model.num_points
+    args = (
+        proj.transform.reshape(n, 9),
+        opacities,
+        softness3.contiguous(),
+        colors,
+        model.color_grads_flat(),
+        model.color_quads_flat(),
+        proj.normal,
+        proj.depths,
+        proj.rects,
+        proj.valid,
+        camera.img_width,
+        camera.img_height,
+    )
+    return proj, args
+
+
+def render_hexels(
+    model: HexelModel,
+    camera: Camera,
+    background: torch.Tensor | None = None,
+    near: float = NEAR_PLANE,
+    scale_modifier: float = 1.0,
+    tile_size: int = DEFAULT_TILE_SIZE,
+    return_aux: bool = False,
+    return_contrib: bool = False,
+    abs_grad_accum: torch.Tensor | None = None,
+    pixel_count_accum: torch.Tensor | None = None,
+    xy_grad_accum: torch.Tensor | None = None,
+    conservative_bounds: bool = False,
+):
+    """Renders a `HexelModel` from `camera` on MPS.
+
+    `conservative_bounds` mirrors hexel-kernel's flag: False (default, as
+    there) clips each primitive's tiles to the historical ellipse window,
+    which models trained by hexels -- including the published checkpoints
+    -- depend on; True uses the exact hexagon bounds (see
+    `reference.hexels_ref.hexel_rects`).
+
+    Returns the (H, W, 3) image, or a `RenderHexelsAux` with every
+    rasterizer output if `return_aux`. View-dependent color (V2 linear, V3
+    SH up to `model.active_sh_degree`, or the specular lobe) is evaluated
+    per primitive here and folded into the base color, as hexels does, so
+    gradients reach the primitive centers through the view direction.
+
+    The projection is plain differentiable PyTorch (an O(N) handful of
+    elementwise ops); only the per-pixel work runs in the Metal kernels.
+    `return_contrib` fills `contrib` (for MCMC relocation). The
+    accumulators are updated in place by backward(): `abs_grad_accum` and
+    `pixel_count_accum` as in `render_2dgs`, `xy_grad_accum` (N, 2) with
+    the signed screen-space gradient.
+    """
+    proj, args = _hexel_inputs(model, camera, near, scale_modifier, conservative_bounds)
+    out = rasterize_hexels(
+        *args,
+        color_model=model.color_index,
+        tile_size=tile_size,
+        near=near,
+        background=background,
+        return_contrib=return_contrib,
+        abs_grad_accum=abs_grad_accum,
+        pixel_count_accum=pixel_count_accum,
+        xy_grad_accum=xy_grad_accum,
+    )
+    if not return_aux:
+        return out.image
+    return RenderHexelsAux(
+        *out,
+        means2d=proj.means2d,
+        valid=proj.valid,
+        projection=proj,
+    )
+
+
+@torch.no_grad()
+def render_hexels_owner(
+    model: HexelModel,
+    camera: Camera,
+    background: torch.Tensor | None = None,
+    near: float = NEAR_PLANE,
+    scale_modifier: float = 1.0,
+    tile_size: int = DEFAULT_TILE_SIZE,
+    conservative_bounds: bool = False,
+) -> HexelOwner:
+    """Per-pixel maximum-compositing-weight primitive (id, weight, local
+    (u, v), SDF value, depth), hexels' `render_owner`, used for
+    contact-patch and wireframe extraction."""
+    _, args = _hexel_inputs(model, camera, near, scale_modifier, conservative_bounds)
+    return rasterize_hexels_owner(
+        *args,
+        color_model=model.color_index,
+        tile_size=tile_size,
+        near=near,
+        background=background,
+    )

@@ -38,10 +38,13 @@ def color_columns(model: SplatModel) -> tuple[np.ndarray, np.ndarray]:
     return dc, rest.astype(np.float32)
 
 
-def write_ply(path: str | Path, columns: dict[str, np.ndarray]) -> None:
+def write_ply(
+    path: str | Path, columns: dict[str, np.ndarray], comments: list[str] | None = None
+) -> None:
     """Writes `columns` (name -> (N,) or (N, k) array, in property order;
     a (N, k) array named `x` becomes properties `x_0 .. x_{k-1}`) as one
-    binary little-endian float32 vertex element."""
+    binary little-endian float32 vertex element, with optional header
+    `comment` lines (ignored by `read_ply`; see `read_ply_comments`)."""
     names, arrays = [], []
     for name, array in columns.items():
         array = np.asarray(array, dtype=np.float32)
@@ -56,6 +59,7 @@ def write_ply(path: str | Path, columns: dict[str, np.ndarray]) -> None:
         [
             "ply",
             "format binary_little_endian 1.0",
+            *[f"comment {c}" for c in (comments or [])],
             f"element vertex {data.shape[0]}",
             *[f"property float {name}" for name in names],
             "end_header",
@@ -64,6 +68,13 @@ def write_ply(path: str | Path, columns: dict[str, np.ndarray]) -> None:
     with open(path, "wb") as f:
         f.write((header + "\n").encode("ascii"))
         f.write(np.ascontiguousarray(data).tobytes())
+
+
+def read_ply_comments(path: str | Path) -> list[str]:
+    """The header `comment` lines of a .ply, without the keyword."""
+    content = Path(path).read_bytes()
+    header = content[: content.index(b"end_header\n")].decode("ascii")
+    return [line[8:] for line in header.splitlines() if line.startswith("comment ")]
 
 
 def read_ply(path: str | Path) -> dict[str, np.ndarray]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -74,6 +75,33 @@ class Camera:
             fy=fy,
             cx=cx,
             cy=cy,
+            img_width=img_width,
+            img_height=img_height,
+        )
+
+    @staticmethod
+    def from_3dgs(
+        world_view_transform,  # (4, 4) 3DGS row-vector layout: [p, 1] @ M
+        fov_x: float,
+        fov_y: float,
+        img_width: int,
+        img_height: int,
+    ) -> Camera:
+        """Converts a 3DGS/2DGS/hexels camera (`world_view_transform` plus
+        field of view, centered principal point) to this pinhole convention.
+
+        Those rasterizers map NDC to pixels as ``W/2 * ndc + (W - 1)/2`` with
+        integer pixel centers; here pixel centers are at ``i + 0.5``, so the
+        same projection is ``cx = W/2`` with ``fx = W / (2 tan(fov_x / 2))``.
+        """
+        m = torch.as_tensor(world_view_transform, dtype=torch.float32)
+        return Camera(
+            R_wc=m[:3, :3].T.contiguous(),
+            t_wc=m[3, :3].clone(),
+            fx=img_width / (2.0 * math.tan(fov_x / 2.0)),
+            fy=img_height / (2.0 * math.tan(fov_y / 2.0)),
+            cx=img_width / 2.0,
+            cy=img_height / 2.0,
             img_width=img_width,
             img_height=img_height,
         )

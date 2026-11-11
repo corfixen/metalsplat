@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Hexels (Honeycomb-Surfels) pipeline: `HexelModel`, `render_hexels`,
+  `render_hexels_owner`, and Metal forward/backward kernels for hexagonal
+  surfels with spatial color fields (flat/linear/quadratic/
+  quadratic_bounded), V2 linear and V3 SH3 view dependence, specular lobe,
+  iso/aniso edge softness, differentiable depth/normal/alpha/distortion/
+  median-depth/overdraw outputs, per-primitive contribution and owner
+  renders, validated against a pure-PyTorch reference of hexel-kernel's
+  CUDA math.
+- Hexel population control (`metalsplat.mcmc_hexels`): contribution-driven
+  MCMC relocation/growth, position noise and adaptive density control.
+- Hexel I/O (`metalsplat.export_hexels`): lossless `.ply` round trip and a
+  loader for checkpoints trained by the hexels reference trainer, including
+  the published pretrained models.
+- `Camera.from_3dgs` for 3DGS/2DGS/hexels-convention cameras.
+- The published DTU scan24 V1/V2/V3 checkpoints render to the paper's
+  held-out PSNR (to within 4e-5 dB on every view), including hexel-kernel's
+  default historical tile window (`conservative_bounds=False`).
+- `examples/train_hexels.py` (NVS, surface, MCMC and densify recipes) and
+  `examples/fit_image_hexels.py`.
+
 ## [0.2.0] - 2026-09-21
 
 ### Added
